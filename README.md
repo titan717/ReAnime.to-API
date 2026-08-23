@@ -1,3 +1,5 @@
+Disclaimer: the API will need to be modified if the site [reanime.to](https://reanime.to) changes its domain or how it interacts and I would not be able to maintain this repo
+
 # reanime-scraper
 
 A self-hosted anime streaming API that scrapes [reanime.to](https://reanime.to) and fully decrypts [flixcloud.cc](https://flixcloud.cc) HLS streams. Works as a drop-in alternative to Consumet. No headless browsers — pure Python + Node.js.
