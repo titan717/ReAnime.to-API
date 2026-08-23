@@ -4,6 +4,6 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "uvicorn reanime:app --host 0.0.0.0 --port $PORT"
+    "startCommand": "python -m uvicorn reanime:app --host 0.0.0.0 --port $PORT"
   }
 }
