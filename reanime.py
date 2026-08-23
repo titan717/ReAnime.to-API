@@ -1,653 +1,550 @@
 #!/usr/bin/env python3
-import asyncio
-import json
+
 import os
-import re
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-BASE = "https://reanime.to"
-FLIX = "https://flixcloud.cc"
-_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-HEADERS = {"User-Agent": _UA, "Accept": "application/json, */*"}
-_DECRYPT_MJS = str(Path(__file__).parent / "decrypt.mjs")
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+BASE_URL = "https://reanime.to"
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json, */*",
+}
 
 _client: Optional[httpx.AsyncClient] = None
 
 
+# ============================================================
+# FASTAPI LIFESPAN
+# ============================================================
+
 @asynccontextmanager
-async def lifespan(_app):
+async def lifespan(app: FastAPI):
     global _client
+
     _client = httpx.AsyncClient(
-        http2=True,
-        timeout=httpx.Timeout(20.0),
+        timeout=httpx.Timeout(
+            connect=10.0,
+            read=30.0,
+            write=30.0,
+            pool=10.0,
+        ),
         limits=httpx.Limits(
             max_connections=50,
-            max_keepalive_connections=20
+            max_keepalive_connections=20,
         ),
         headers=HEADERS,
         follow_redirects=True,
     )
+
     yield
+
     await _client.aclose()
+    _client = None
 
 
-app = FastAPI(title="ReAnime Scraper", lifespan=lifespan)
+# ============================================================
+# APP
+# ============================================================
+
+app = FastAPI(
+    title="ReAnime API",
+    description="Custom API wrapper for the current Re:Anime API",
+    version="2.0.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ---------------------------------------------------------
-# TEMPORARY DIAGNOSTIC ENDPOINT
-# ---------------------------------------------------------
-
-@app.get("/debug-routes")
-async def debug_routes():
-    return [
-        {
-            "path": route.path,
-            "methods": list(route.methods or []),
-        }
-        for route in app.routes
-    ]
-
-
-# ---------------------------------------------------------
+# ============================================================
 # HTTP HELPER
-# ---------------------------------------------------------
+# ============================================================
 
-async def _get(
+async def reanime_get(
     path: str,
-    params: dict = None,
-    base: str = BASE
+    params: Optional[dict[str, Any]] = None,
 ) -> Any:
-    r = await _client.get(
-        f"{base}{path}",
-        params=params
-    )
 
-    if r.status_code == 404:
+    if _client is None:
         raise HTTPException(
-            404,
-            detail="Not found"
+            status_code=503,
+            detail="HTTP client is not ready",
         )
 
-    if not r.is_success:
-        raise HTTPException(
-            r.status_code,
-            detail=r.text[:300]
-        )
-
-    return r.json()
-
-
-# ---------------------------------------------------------
-# ANILIST ID
-# ---------------------------------------------------------
-
-def _anilist_from_anime(
-    anime: dict
-) -> Optional[int]:
-
-    if not anime:
-        return None
-
-    if anime.get("anilist"):
-        return int(anime["anilist"])
-
-    for key in (
-        "extra_large",
-        "large",
-        "medium"
-    ):
-        url = (
-            anime.get("cover_image") or {}
-        ).get(key, "")
-
-        m = re.search(
-            r"/bx(\d+)-",
-            url
-        )
-
-        if m:
-            return int(m.group(1))
-
-    return None
-
-
-# ---------------------------------------------------------
-# FLIXCLOUD DECRYPTION
-# ---------------------------------------------------------
-
-async def _decrypt_embed(
-    html: bytes
-) -> dict:
-
-    proc = await asyncio.create_subprocess_exec(
-        "node",
-        _DECRYPT_MJS,
-        "-",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    url = f"{BASE_URL}{path}"
 
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(
-                input=html
-            ),
-            timeout=20.0
+        response = await _client.get(
+            url,
+            params=params,
         )
 
-    except asyncio.TimeoutError:
-        proc.kill()
+    except httpx.TimeoutException:
         raise HTTPException(
-            504,
-            detail="Decrypt subprocess timed out"
+            status_code=504,
+            detail="Re:Anime request timed out",
         )
 
-    if proc.returncode != 0:
+    except httpx.HTTPError as exc:
         raise HTTPException(
-            502,
-            detail=(
-                "Decrypt error: "
-                f"{stderr.decode()[:300]}"
-            )
+            status_code=502,
+            detail=f"Re:Anime request failed: {str(exc)}",
         )
 
-    return json.loads(stdout)
-
-
-async def get_stream_url(
-    access_id: str,
-    v: int = 2
-) -> dict:
-
-    r = await _client.get(
-        f"{FLIX}/e/{access_id}?v={v}",
-        headers={
-            **HEADERS,
-            "Referer": f"{BASE}/"
-        }
-    )
-
-    if not r.is_success:
+    if response.status_code == 404:
         raise HTTPException(
-            r.status_code,
-            detail=(
-                f"Embed fetch failed: "
-                f"{r.status_code}"
-            )
+            status_code=404,
+            detail=f"Re:Anime endpoint not found: {path}",
         )
 
-    return await _decrypt_embed(
-        r.content
-    )
-
-
-# ---------------------------------------------------------
-# SERVERS
-# ---------------------------------------------------------
-
-async def _servers(
-    slug: str,
-    ep: int,
-    anilist_id: Optional[int] = None
-) -> dict:
-
-    watch = await _get(
-        f"/api/watch/{slug}/{ep}"
-    )
-
-    aid = (
-        anilist_id
-        or _anilist_from_anime(
-            watch.get("anime")
+    if not response.is_success:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=response.text[:500],
         )
-    )
 
-    flix: dict = {}
+    try:
+        return response.json()
 
-    if aid:
-        try:
-            flix = await _get(
-                f"/api/flix/{aid}/{ep}"
-            )
-        except HTTPException:
-            pass
-
-    links = list(
-        watch.get("episode_links") or []
-    )
-
-    if (
-        flix.get("success")
-        and flix.get("servers")
-    ):
-        seen = {
-            s.get("$id")
-            for s in links
-        }
-
-        for s in flix["servers"]:
-            if s.get("$id") not in seen:
-                links.append(s)
-
-    _order = {
-        "HD-2": 0,
-        "HD-1": 1
-    }
-
-    _sort = lambda lst: sorted(
-        lst,
-        key=lambda s:
-            _order.get(
-                s.get("serverName", ""),
-                9
-            )
-    )
-
-    return {
-        "sub": _sort([
-            s for s in links
-            if s.get("dataType")
-            in ("sub", "s-sub")
-        ]),
-
-        "dub": _sort([
-            s for s in links
-            if s.get("dataType")
-            in ("dub", "s-dub")
-        ]),
-
-        "anime": watch.get("anime"),
-        "current": watch.get("current"),
-        "duration": watch.get("duration"),
-
-        "intro_start":
-            watch.get("intro_start"),
-
-        "intro_end":
-            watch.get("intro_end"),
-
-        "outro_start":
-            watch.get("outro_start"),
-
-        "outro_end":
-            watch.get("outro_end"),
-
-        "anilist_id": aid,
-    }
+    except ValueError:
+        raise HTTPException(
+            status_code=502,
+            detail="Re:Anime returned invalid JSON",
+        )
 
 
-# ---------------------------------------------------------
+# ============================================================
 # ROOT
-# ---------------------------------------------------------
+# ============================================================
 
 @app.get("/")
 async def root():
-
     return {
         "status": "ok",
+        "service": "ReAnime API",
+        "version": "2.0.0",
 
         "endpoints": {
+            "health":
+                "GET /health",
+
             "search":
-                "GET /search?q=...&limit=20",
-
-            "home":
-                "GET /home?limit=20",
-
-            "top":
-                "GET /top?period=week&limit=20",
-
-            "schedule":
-                "GET /schedule",
+                "GET /search?q=naruto&limit=20&offset=0",
 
             "info":
-                "GET /info/{slug}",
+                "GET /info/{anime_id}",
 
             "episodes":
-                "GET /episodes/{slug}",
-
-            "servers":
-                "GET /servers/{slug}/{episode}[?anilist_id=...]",
-
-            "stream":
-                "GET /stream/{access_id}[?v=2]",
-
-            "stream_link":
-                "GET /stream/from-link?link={flixcloud_url}",
-
-            "thumbnails":
-                "GET /thumbnails/{anilist_id}",
+                "GET /episodes/{anime_id}?limit=2000",
 
             "recommendations":
-                "GET /recommendations/{slug}",
+                "GET /recommendations/{anime_id}",
+
+            "schedule":
+                "GET /schedule?tz=Asia/Calcutta&week=0",
+
+            "servers":
+                "GET /servers/{anime_id}/{episode}?anilist_id=20",
+
+            "stream":
+                "GET /stream/{anime_id}/{episode}?server=HD-2&type=sub&anilist_id=20",
         },
     }
 
 
-# ---------------------------------------------------------
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "ReAnime API",
+        "upstream": BASE_URL,
+    }
+
+
+# ============================================================
 # SEARCH
-# ---------------------------------------------------------
+#
+# Verified:
+# GET /api/v1/search?limit=5&q=naruto
+# ============================================================
 
 @app.get("/search")
 async def search(
     q: str = Query(
         ...,
-        min_length=1
+        min_length=1,
     ),
-
     limit: int = Query(
         20,
         ge=1,
-        le=100
+        le=100,
     ),
-
     offset: int = Query(
         0,
-        ge=0
+        ge=0,
     ),
 ):
-
-    return await _get(
-        "/api/search",
+    return await reanime_get(
+        "/api/v1/search",
         {
-            "q": q,
             "limit": limit,
-            "offset": offset
-        }
+            "offset": offset,
+            "q": q,
+        },
     )
 
 
-# ---------------------------------------------------------
-# HOME
-# ---------------------------------------------------------
+# ============================================================
+# ANIME INFO
+#
+# Verified:
+# GET /api/v1/anime/{anime_id}/meta
+# ============================================================
 
-@app.get("/home")
-async def home(
-    limit: int = Query(
-        20,
-        ge=1,
-        le=100
-    )
+@app.get("/info/{anime_id}")
+async def anime_info(
+    anime_id: str,
 ):
-
-    latest, top = await asyncio.gather(
-
-        _get(
-            "/api/home/latest-aired",
-            {
-                "limit": limit
-            }
-        ),
-
-        _get(
-            "/api/top/anime",
-            {
-                "period": "week",
-                "limit": limit
-            }
-        )
+    return await reanime_get(
+        f"/api/v1/anime/{anime_id}/meta"
     )
 
-    return {
-        "latest_aired": latest,
-        "top_weekly": top
-    }
 
+# ============================================================
+# EPISODES
+#
+# Verified:
+# GET /api/v1/anime/{anime_id}/episodes?limit=2000
+# ============================================================
 
-# ---------------------------------------------------------
-# TOP
-# ---------------------------------------------------------
-
-@app.get("/top")
-async def top(
-    period: str = Query(
-        "week",
-        pattern="^(day|week|month)$"
-    ),
-
+@app.get("/episodes/{anime_id}")
+async def episodes(
+    anime_id: str,
     limit: int = Query(
-        20,
+        2000,
         ge=1,
-        le=100
+        le=5000,
     ),
 ):
-
-    return await _get(
-        "/api/top/anime",
+    return await reanime_get(
+        f"/api/v1/anime/{anime_id}/episodes",
         {
-            "period": period,
-            "limit": limit
-        }
+            "limit": limit,
+        },
     )
 
 
-# ---------------------------------------------------------
+# ============================================================
+# RECOMMENDATIONS
+#
+# Verified:
+# GET /api/v1/anime/{anime_id}/recommendations
+# ============================================================
+
+@app.get("/recommendations/{anime_id}")
+async def recommendations(
+    anime_id: str,
+):
+    return await reanime_get(
+        f"/api/v1/anime/{anime_id}/recommendations"
+    )
+
+
+# ============================================================
 # SCHEDULE
-# ---------------------------------------------------------
+#
+# Verified:
+# GET /api/v1/schedule?tz=Asia/Calcutta&week=0
+# ============================================================
 
 @app.get("/schedule")
-async def schedule():
-
-    return await _get(
-        "/api/schedule"
-    )
-
-
-# ---------------------------------------------------------
-# ANIME INFO
-# ---------------------------------------------------------
-
-@app.get("/info/{slug}")
-async def anime_info(
-    slug: str
+async def schedule(
+    tz: str = Query(
+        "Asia/Calcutta",
+    ),
+    week: int = Query(
+        0,
+        ge=-10,
+        le=10,
+    ),
 ):
+    return await reanime_get(
+        "/api/v1/schedule",
+        {
+            "tz": tz,
+            "week": week,
+        },
+    )
 
-    meta, eps = await asyncio.gather(
 
-        _get(
-            f"/api/watch/{slug}/1"
-        ),
+# ============================================================
+# GET SERVER INFORMATION
+#
+# Verified:
+# GET /api/flix/{anilist_id}/{episode}
+#
+# Example:
+# /api/flix/20/2
+# ============================================================
 
-        _get(
-            f"/api/episodes/{slug}"
+@app.get("/servers/{anime_id}/{episode}")
+async def servers(
+    anime_id: str,
+    episode: int,
+    anilist_id: Optional[int] = Query(
+        None,
+        description="AniList ID",
+    ),
+):
+    if episode < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Episode must be >= 1",
         )
-    )
 
-    anime = (
-        meta.get("anime")
-        or {}
-    )
+    # If the frontend already knows the AniList ID,
+    # use it directly.
+    if anilist_id is None:
 
-    anilist_id = (
-        _anilist_from_anime(
-            anime
+        # Get anime metadata.
+        meta = await reanime_get(
+            f"/api/v1/anime/{anime_id}/meta"
         )
-    )
 
-    ep_list = (
-        eps
-        if isinstance(eps, list)
-        else eps.get(
-            "data",
-            eps.get(
-                "episodes",
-                []
+        # ReAnime normally exposes the AniList ID
+        # in its metadata.
+        anilist_id = meta.get("anilist_id")
+
+        # Some responses may use "id".
+        if not anilist_id:
+            anilist_id = meta.get("id")
+
+        if not anilist_id:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Could not determine AniList ID. "
+                    "Pass ?anilist_id=..."
+                ),
             )
-        )
+
+    data = await reanime_get(
+        f"/api/flix/{anilist_id}/{episode}"
     )
 
     return {
-        **anime,
-        "episodes": ep_list,
-        "anilist_id": anilist_id
+        "success": data.get(
+            "success",
+            False,
+        ),
+
+        "anime_id": anime_id,
+
+        "anilist_id": anilist_id,
+
+        "episode": episode,
+
+        "servers": data.get(
+            "servers",
+            [],
+        ),
     }
 
 
-# ---------------------------------------------------------
-# EPISODES
-# ---------------------------------------------------------
+# ============================================================
+# PLAYBACK HANDOFF
+#
+# This selects one of the server links returned by Re:Anime.
+#
+# Example:
+# /stream/naruto-bjfend/2
+#     ?server=HD-2
+#     &type=sub
+#     &anilist_id=20
+#
+# Returns the authorized embed/dataLink.
+# ============================================================
 
-@app.get("/episodes/{slug}")
-async def episodes(
-    slug: str
-):
-
-    data = await _get(
-        f"/api/episodes/{slug}"
-    )
-
-    if isinstance(
-        data,
-        list
-    ):
-        return data
-
-    return data.get(
-        "data",
-        data.get(
-            "episodes",
-            data
-        )
-    )
-
-
-# ---------------------------------------------------------
-# SERVERS
-# ---------------------------------------------------------
-
-@app.get(
-    "/servers/{slug}/{episode}"
-)
-async def servers(
-    slug: str,
-    episode: int,
-    anilist_id: Optional[int] =
-        Query(None)
-):
-
-    return await _servers(
-        slug,
-        episode,
-        anilist_id
-    )
-
-
-# ---------------------------------------------------------
-# STREAM FROM LINK
-# ---------------------------------------------------------
-
-@app.get(
-    "/stream/from-link"
-)
-async def stream_from_link(
-    link: str = Query(...)
-):
-
-    m = re.search(
-        r"/e/([^?#\s]+)\?v=(\d+)",
-        link
-    )
-
-    if not m:
-        raise HTTPException(
-            400,
-            detail=(
-                "Expected URL: "
-                "https://flixcloud.cc/e/"
-                "{id}?v={1|2}"
-            )
-        )
-
-    return await get_stream_url(
-        m.group(1),
-        int(m.group(2))
-    )
-
-
-# ---------------------------------------------------------
-# STREAM
-# ---------------------------------------------------------
-
-@app.get(
-    "/stream/{access_id}"
-)
+@app.get("/stream/{anime_id}/{episode}")
 async def stream(
-    access_id: str,
-    v: int = Query(
-        2,
-        ge=1,
-        le=2
-    )
+    anime_id: str,
+    episode: int,
+
+    server: str = Query(
+        "HD-2",
+        description="HD-1 or HD-2",
+    ),
+
+    type: str = Query(
+        "sub",
+        pattern="^(sub|dub)$",
+        description="sub or dub",
+    ),
+
+    anilist_id: Optional[int] = Query(
+        None,
+        description="AniList ID",
+    ),
 ):
+    if episode < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Episode must be >= 1",
+        )
 
-    return await get_stream_url(
-        access_id,
-        v
+    if server not in {
+        "HD-1",
+        "HD-2",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="server must be HD-1 or HD-2",
+        )
+
+    # Determine AniList ID when it wasn't supplied.
+    if anilist_id is None:
+
+        meta = await reanime_get(
+            f"/api/v1/anime/{anime_id}/meta"
+        )
+
+        anilist_id = meta.get(
+            "anilist_id"
+        )
+
+        if not anilist_id:
+            anilist_id = meta.get(
+                "id"
+            )
+
+        if not anilist_id:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Could not determine AniList ID. "
+                    "Pass ?anilist_id=..."
+                ),
+            )
+
+    # Get the available servers.
+    data = await reanime_get(
+        f"/api/flix/{anilist_id}/{episode}"
     )
 
-
-# ---------------------------------------------------------
-# THUMBNAILS
-# ---------------------------------------------------------
-
-@app.get(
-    "/thumbnails/{anilist_id}"
-)
-async def thumbnails(
-    anilist_id: int
-):
-
-    return await _get(
-        f"/api/thumbnails/{anilist_id}"
+    available_servers = data.get(
+        "servers",
+        [],
     )
 
+    # Find requested server + language.
+    selected = None
 
-# ---------------------------------------------------------
-# RECOMMENDATIONS
-# ---------------------------------------------------------
+    for item in available_servers:
 
-@app.get(
-    "/recommendations/{slug}"
-)
-async def recommendations(
-    slug: str
-):
+        if (
+            item.get("serverName") == server
+            and item.get("dataType") == type
+        ):
+            selected = item
+            break
 
-    return await _get(
-        f"/api/anime/{slug}/recommendations"
+    if selected is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Requested server unavailable",
+                "server": server,
+                "type": type,
+                "available": available_servers,
+            },
+        )
+
+    data_link = selected.get(
+        "dataLink"
     )
 
+    if not data_link:
+        raise HTTPException(
+            status_code=502,
+            detail="Server did not provide a playback link",
+        )
 
-# ---------------------------------------------------------
-# RUN LOCALLY
-# ---------------------------------------------------------
+    return {
+        "success": True,
+
+        "anime_id": anime_id,
+
+        "anilist_id": anilist_id,
+
+        "episode": episode,
+
+        "server": server,
+
+        "type": type,
+
+        "dataType": selected.get(
+            "dataType"
+        ),
+
+        "softsub": selected.get(
+            "softsub",
+            False,
+        ),
+
+        "continue": selected.get(
+            "continue",
+            False,
+        ),
+
+        # Authorized embed/data link returned by Re:Anime.
+        "url": data_link,
+    }
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
     import uvicorn
 
+    port = int(
+        os.getenv(
+            "PORT",
+            "8000",
+        )
+    )
+
     uvicorn.run(
         "rean​ime:app",
         host="0.0.0.0",
-        port=int(
-            os.getenv(
-                "PORT",
-                8000
-            )
-        ),
+        port=port,
         workers=1,
-        reload=False
+        reload=False,
     )
