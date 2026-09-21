@@ -268,6 +268,272 @@ async def get_tv_chain_for_anilist_id(media_id: int):
 
     return chain
 
+import os
+import time
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+CANONICAL_CATALOG_SEED = {
+    "attack-on-titan": {
+        "franchise": {
+            "id": 1,
+            "slug": "attack-on-titan",
+            "title": "Attack on Titan",
+            "description": "Humanity fights for survival against giant humanoid Titans."
+        },
+        "seasons": [
+            {
+                "id": 1,
+                "season_number": 1,
+                "title": "Season 1",
+                "display_title": "Season 1",
+                "parts": [
+                    {
+                        "id": 1,
+                        "part_number": 1,
+                        "title": "Season 1",
+                        "display_title": "Season 1",
+                        "reanime_id": "attack-on-titan-p9y2p9",
+                        "anilist_id": 16498,
+                        "format": "TV"
+                    }
+                ]
+            },
+            {
+                "id": 2,
+                "season_number": 2,
+                "title": "Season 2",
+                "display_title": "Season 2",
+                "parts": [
+                    {
+                        "id": 2,
+                        "part_number": 1,
+                        "title": "Season 2",
+                        "display_title": "Season 2",
+                        "reanime_id": "attack-on-titan-season-2-nn7gs9",
+                        "anilist_id": 20958,
+                        "format": "TV"
+                    }
+                ]
+            },
+            {
+                "id": 3,
+                "season_number": 3,
+                "title": "Season 3",
+                "display_title": "Season 3",
+                "parts": [
+                    {
+                        "id": 3,
+                        "part_number": 1,
+                        "title": "Season 3",
+                        "display_title": "Season 3",
+                        "reanime_id": "attack-on-titan-season-3-d5sm7p",
+                        "anilist_id": 99147,
+                        "format": "TV"
+                    }
+                ]
+            },
+            {
+                "id": 4,
+                "season_number": 4,
+                "title": "Season 4",
+                "display_title": "Season 4",
+                "parts": [
+                    {
+                        "id": 4,
+                        "part_number": 1,
+                        "title": "Part 1",
+                        "display_title": "Part 1",
+                        "reanime_id": "attack-on-titan-final-season-z8gsmy",
+                        "anilist_id": 110277,
+                        "format": "TV"
+                    },
+                    {
+                        "id": 5,
+                        "part_number": 2,
+                        "title": "Part 2",
+                        "display_title": "Part 2",
+                        "reanime_id": "attack-on-titan-final-season-part-2-s66894",
+                        "anilist_id": 131681,
+                        "format": "TV"
+                    },
+                    {
+                        "id": 6,
+                        "part_number": 3,
+                        "title": "Final Chapters",
+                        "display_title": "Final Chapters",
+                        "reanime_id": "attack-on-titan-final-chapters-part-1-or1249",
+                        "anilist_id": 146690,
+                        "format": "SPECIAL"
+                    }
+                ]
+            }
+        ]
+    }
+}
+
+REANIME_SLUG_MAP = {
+    "attack-on-titan-p9y2p9": "attack-on-titan",
+    "attack-on-titan-season-2-nn7gs9": "attack-on-titan",
+    "attack-on-titan-season-3-d5sm7p": "attack-on-titan",
+    "attack-on-titan-season-3-part-2-u8gdy6": "attack-on-titan",
+    "attack-on-titan-final-season-z8gsmy": "attack-on-titan",
+    "attack-on-titan-final-season-part-2-s66894": "attack-on-titan",
+    "attack-on-titan-final-chapters-part-1-or1249": "attack-on-titan",
+    "attack-on-titan": "attack-on-titan",
+}
+
+async def get_catalog_record(identifier: str):
+    # Attempt DB lookup if DATABASE_URL is configured
+    if DATABASE_URL:
+        try:
+            import asyncpg
+            conn = await asyncpg.connect(DATABASE_URL, timeout=5.0)
+            try:
+                # Query franchise by slug, or by anime entry reanime_id, or season_part reanime_id
+                row = await conn.fetchrow("""
+                    SELECT f.id, f.slug, f.canonical_title, f.description
+                    FROM franchises f
+                    LEFT JOIN anime_entries ae ON ae.franchise_id = f.id
+                    LEFT JOIN seasons s ON s.franchise_id = f.id
+                    LEFT JOIN season_parts sp ON sp.season_id = s.id
+                    WHERE f.slug = $1 OR ae.reanime_id = $1 OR sp.reanime_id = $1
+                       OR CAST(ae.anilist_id AS text) = $1 OR CAST(sp.anilist_id AS text) = $1
+                    LIMIT 1
+                """, str(identifier))
+                
+                if row:
+                    f_id = row['id']
+                    f_slug = row['slug']
+                    f_title = row['canonical_title']
+                    f_desc = row['description']
+                    
+                    s_rows = await conn.fetch("""
+                        SELECT id, season_number, canonical_title, display_title
+                        FROM seasons
+                        WHERE franchise_id = $1
+                        ORDER BY season_number ASC
+                    """, f_id)
+                    
+                    seasons = []
+                    for sr in s_rows:
+                        p_rows = await conn.fetch("""
+                            SELECT id, part_number, canonical_title, display_title, reanime_id, anilist_id, format
+                            FROM season_parts
+                            WHERE season_id = $1
+                            ORDER BY part_number ASC
+                        """, sr['id'])
+                        
+                        parts = []
+                        for pr in p_rows:
+                            parts.append({
+                                "id": pr['id'],
+                                "part_number": pr['part_number'],
+                                "title": pr['display_title'] or pr['canonical_title'],
+                                "display_title": pr['display_title'],
+                                "reanime_id": pr['reanime_id'],
+                                "anilist_id": pr['anilist_id'],
+                                "format": pr['format'] or "TV"
+                            })
+                            
+                        seasons.append({
+                            "id": sr['id'],
+                            "season_number": sr['season_number'],
+                            "title": sr['display_title'] or sr['canonical_title'],
+                            "display_title": sr['display_title'],
+                            "parts": parts
+                        })
+                        
+                    return {
+                        "franchise": {
+                            "id": f_id,
+                            "slug": f_slug,
+                            "title": f_title,
+                            "description": f_desc
+                        },
+                        "seasons": seasons
+                    }
+            finally:
+                await conn.close()
+        except Exception:
+            pass  # Fallback to seed catalog or dynamic resolution
+            
+    # Check seed catalog fallback
+    slug = REANIME_SLUG_MAP.get(str(identifier).lower())
+    if not slug:
+        for s_key in CANONICAL_CATALOG_SEED:
+            if s_key in str(identifier).lower():
+                slug = s_key
+                break
+                
+    if slug and slug in CANONICAL_CATALOG_SEED:
+        return CANONICAL_CATALOG_SEED[slug]
+        
+    return None
+
+# Catalog Endpoints
+@app.get("/catalog/resolve/{anime_id}")
+@app.get("/catalog/anime/{anime_id}")
+async def get_catalog_anime(anime_id: str):
+    cat = await get_catalog_record(anime_id)
+    if cat:
+        return cat
+    # Fallback to dynamic resolution formatted into catalog structure
+    try:
+        seasons_data = await get_seasons(anime_id)
+        seasons_list = seasons_data.get("seasons", [])
+        return {
+            "franchise": {
+                "id": anime_id,
+                "slug": anime_id,
+                "title": anime_id.replace("-", " ").title()
+            },
+            "seasons": [
+                {
+                    "id": s["season_number"],
+                    "season_number": s["season_number"],
+                    "title": s["title"],
+                    "parts": [
+                        {
+                            "id": s["season_number"],
+                            "part_number": 1,
+                            "title": s["title"],
+                            "reanime_id": s["anime_id"],
+                            "anilist_id": s.get("anilist_id", 0),
+                            "format": "TV"
+                        }
+                    ]
+                }
+                for s in seasons_list
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Catalog entry not found: {str(e)}")
+
+@app.get("/catalog/franchise/{franchise_id}")
+async def get_catalog_franchise(franchise_id: str):
+    return await get_catalog_anime(franchise_id)
+
+@app.get("/catalog/franchise/{franchise_id}/seasons")
+async def get_catalog_franchise_seasons(franchise_id: str):
+    cat = await get_catalog_anime(franchise_id)
+    return {"franchise": cat.get("franchise"), "seasons": cat.get("seasons", [])}
+
+@app.get("/catalog/season/{season_id}")
+async def get_catalog_season_by_id(season_id: int):
+    # Lookup in seed or DB
+    for key, data in CANONICAL_CATALOG_SEED.items():
+        for s in data["seasons"]:
+            if s["id"] == season_id:
+                return {"season": s}
+    raise HTTPException(status_code=404, detail="Season not found")
+
+@app.get("/catalog/season/{season_id}/parts")
+async def get_catalog_season_parts(season_id: int):
+    s_data = await get_catalog_season_by_id(season_id)
+    season = s_data.get("season", {})
+    return {"season_id": season_id, "parts": season.get("parts", [])}
+
 @app.get("/seasons/{anime_id}")
 async def get_seasons(anime_id: str):
     now = time.time()
@@ -275,6 +541,28 @@ async def get_seasons(anime_id: str):
         cached_val, expiry = _SEASONS_CACHE[anime_id]
         if now < expiry:
             return cached_val
+
+    # Check canonical catalog first
+    cat = await get_catalog_record(anime_id)
+    if cat:
+        seasons_arr = []
+        for s in cat["seasons"]:
+            main_part = s["parts"][0] if s.get("parts") else {}
+            seasons_arr.append({
+                "season_number": s["season_number"],
+                "anime_id": main_part.get("reanime_id", anime_id),
+                "anilist_id": main_part.get("anilist_id", 0),
+                "title": s["title"],
+                "episode_count": 0,
+                "parts": s.get("parts", [])
+            })
+        result = {
+            "anime_id": anime_id,
+            "franchise": cat["franchise"]["title"],
+            "seasons": seasons_arr
+        }
+        _SEASONS_CACHE[anime_id] = (result, time.time() + 1800)
+        return result
 
     try:
         meta = await fetch_reanime(f"/api/v1/anime/{anime_id}/meta")
@@ -341,7 +629,8 @@ async def get_seasons(anime_id: str):
         raise HTTPException(status_code=404, detail=str(e))
 
 @app.get("/seasons/{anime_id}/{season_number}/episodes")
-async def get_season_episodes(anime_id: str, season_number: int):
+async def get_season_episodes(anime_id: str, season_number: int, part: int = 1, part_number: int = 1):
+    selected_part = part if part != 1 else part_number
     try:
         # Get seasons list for this anime
         seasons_res = await get_seasons(anime_id)
@@ -357,10 +646,18 @@ async def get_season_episodes(anime_id: str, season_number: int):
             raise HTTPException(status_code=404, detail="Season not found")
         
         season_anime_id = target_season.get("anime_id", anime_id)
+        parts = target_season.get("parts", [])
+        if parts:
+            for p in parts:
+                if p.get("part_number") == selected_part:
+                    season_anime_id = p.get("reanime_id", season_anime_id)
+                    break
+
         eps_data = await fetch_reanime(f"/api/v1/anime/{season_anime_id}/episodes", {"limit": 2000})
         return {
             "anime_id": anime_id,
             "season_number": season_number,
+            "part_number": selected_part,
             "season_anime_id": season_anime_id,
             "episodes": eps_data.get("data", [])
         }

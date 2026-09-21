@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 httpx[http2]
 pycryptodome
+asyncpg
+psycopg2-binary
