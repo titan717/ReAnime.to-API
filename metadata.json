@@ -1,0 +1,6 @@
+{
+  "name": "ReAnime API",
+  "description": "Self-hosted anime streaming API that scrapes ReAnime.to and fully decrypts FlixCloud HLS streams",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

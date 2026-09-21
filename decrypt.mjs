@@ -62,6 +62,58 @@ function extractSsrObj(html) {
   throw new Error("SSR brace matching failed");
 }
 
+async function decryptStream(dataLink) {
+  const r = await fetch(dataLink, {
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Referer": "https://reanime.to/" },
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status} from ${dataLink}`);
+  const html = await r.text();
+
+  const data   = eval("(" + extractSsrObj(html) + ")");
+  const seed   = data.obfuscation_seed;
+  const fields = le(seed);
+  const ocd    = data.obfuscated_crypto_data;
+  const obj    = ocd[fields.containerName][fields.arrayName][0][fields.objectName];
+  const frag1  = rt(obj[fields.keyField]);
+  const iv     = rt(obj[fields.ivField]);
+  const kf2    = rt(data[fields.keyFrag2Field]);
+  const token  = data[fields.tokenField];
+
+  if (!token) throw new Error("Token field missing from embed data");
+
+  const tokData = await fetchJson(`https://flixcloud.cc/api/m3u8/${token}`, { Referer: "https://reanime.to/" });
+  const vidKey  = sha256hex(token + "vid").substring(0, 10);
+  const keyKey  = sha256hex(token + "key").substring(0, 10);
+  const v_bytes = rt(tokData[vidKey]);
+  const T_bytes = rt(tokData[keyKey]);
+
+  if (!v_bytes.length || !T_bytes.length)
+    throw new Error(`Token missing fields. Got: ${Object.keys(tokData).join(",")}`);
+
+  const wasmOut = await runWasm(data.w_payload, frag1, kf2, T_bytes, parseInt(seed.substring(0, 8), 16));
+  const pbk     = crypto.pbkdf2Sync(wasmOut, seed, 1000, 32, "sha256");
+  const r_buf   = Buffer.from(pbk);
+  for (let i = 0; i < 32; i++) r_buf[i] ^= seed.charCodeAt(i % seed.length);
+  const aesKey  = crypto.createHash("sha256").update(r_buf).digest();
+
+  const decipher = crypto.createDecipheriv("aes-256-cbc", aesKey, iv);
+  const url      = Buffer.concat([decipher.update(v_bytes), decipher.final()]).toString("utf8").trim();
+
+  if (!url.startsWith("http")) throw new Error(`Unexpected URL: ${url}`);
+
+  return {
+    url,
+    subtitles:      data.subtitles      ?? [],
+    thumbnails_vtt: data.thumbnails_vtt ?? null,
+    video_title:    data.video_title    ?? null,
+    intro_chapter:  data.intro_chapter  ?? null,
+    outro_chapter:  data.outro_chapter  ?? null,
+    video_id:       data.video_id       ?? null,
+  };
+}
+
+export { decryptStream };
+
 async function main() {
   let html;
   const arg = process.argv[2] ?? "-";
@@ -71,6 +123,13 @@ async function main() {
     html = Buffer.concat(chunks).toString();
   } else {
     html = readFileSync(arg, "utf8");
+  }
+
+  // If argument is a flixcloud URL
+  if (arg.startsWith("http")) {
+    const res = await decryptStream(arg);
+    process.stdout.write(JSON.stringify(res));
+    return;
   }
 
   const data   = eval("(" + extractSsrObj(html) + ")");
@@ -116,7 +175,9 @@ async function main() {
   }));
 }
 
-main().catch((err) => {
-  process.stderr.write(err.message + "\n");
-  process.exit(1);
-});
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => {
+    process.stderr.write(err.message + "\n");
+    process.exit(1);
+  });
+}

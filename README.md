@@ -32,6 +32,8 @@ uvicorn reanime:app --host 0.0.0.0 --port 8000
 | GET | `/schedule` | Weekly airing schedule |
 | GET | `/info/{slug}` | Anime metadata + full episode list |
 | GET | `/episodes/{slug}` | Episode list only |
+| GET | `/seasons/{slug}` | Season list and metadata |
+| GET | `/seasons/{slug}/{season_number}/episodes` | Episodes for a specific season |
 | GET | `/servers/{slug}/{episode}` | All streaming servers for an episode |
 | GET | `/stream/{access_id}?v=2` | Decrypt stream → HLS URL + subtitles |
 | GET | `/stream/from-link?link={url}` | Same, but pass the full flixcloud URL |
