@@ -107,6 +107,29 @@ async def search(q: str, limit: int = 20, offset: int = 0):
 async def info(anime_id: str):
     return await fetch_reanime(f"/api/v1/anime/{anime_id}/meta")
 
+@app.get("/trailer/{anime_id}")
+async def trailer(anime_id: str):
+    """Return the official AniList trailer when one is available."""
+    meta = await fetch_reanime(f"/api/v1/anime/{anime_id}/meta")
+    aid = meta.get("anilist_id")
+    if not aid:
+        raise HTTPException(status_code=404, detail="AniList ID unavailable for trailer lookup")
+    query = '''
+    query ($id: Int) {
+      Media (id: $id, type: ANIME) {
+        id
+        title { romaji english }
+        trailer { id site thumbnail }
+      }
+    }
+    '''
+    resp = await anilist_graphql(query, {"id": int(aid)})
+    media = (resp or {}).get("data", {}).get("Media")
+    tr = media.get("trailer") if media else None
+    if not tr or not tr.get("id"):
+        return {"available": False, "trailer": None}
+    return {"available": True, "trailer": tr}
+
 @app.get("/episodes/{anime_id}")
 async def episodes(anime_id: str, limit: int = 2000):
     return await fetch_reanime(f"/api/v1/anime/{anime_id}/episodes", {"limit": limit})
