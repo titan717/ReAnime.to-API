@@ -1,18 +1,39 @@
 import json
 import subprocess
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
+import os
 
 app = FastAPI(title="ReAnime API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Optional production client key.
+# When KINOMA_API_KEY is configured in Vercel, every API route except
+# health/root/OpenAPI documentation requires X-Kinoma-API-Key.
+# The key is intentionally not embedded in this backend source.
+KINOMA_API_KEY = os.getenv("KINOMA_API_KEY")
+
+_PUBLIC_PATHS = {"/", "/health", "/docs", "/redoc", "/openapi.json"}
+
+@app.middleware("http")
+async def require_kinoma_api_key(request: Request, call_next):
+    if KINOMA_API_KEY and request.url.path not in _PUBLIC_PATHS:
+        supplied = request.headers.get("X-Kinoma-API-Key")
+        if not supplied or supplied != KINOMA_API_KEY:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Valid X-Kinoma-API-Key required."},
+            )
+    return await call_next(request)
 
 UPSTREAM_BASE = "https://reanime.to"
 HEADERS = {
